@@ -4,97 +4,127 @@ os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
 warnings.filterwarnings("ignore", message=".*torchvision.*")
 
 import streamlit as st
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
 from dotenv import load_dotenv
 from groq import Groq
 
-# ✅ Load env FIRST
+from rag_pipeline import RAGPipeline
+
+# -- Env & client --------------------------------------------------------------
 load_dotenv()
 
-# ✅ Initialize Groq client
-client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+if not GROQ_API_KEY:
+    st.error("GROQ_API_KEY not found. Add it to your .env file.")
+    st.stop()
 
+client = Groq(api_key=GROQ_API_KEY)
+
+# -- Page config ---------------------------------------------------------------
+st.set_page_config(page_title="ContextIQ", layout="wide")
 st.title("ContextIQ")
+st.caption("RAG-powered PDF Q&A — Hybrid Search (BM25 + FAISS) via Groq LLM")
 
-uploaded_file = st.file_uploader("Upload a PDF", type="pdf")
+# -- Sidebar -------------------------------------------------------------------
+with st.sidebar:
+    st.header("Retrieval Settings")
+    k             = st.slider("Chunks to retrieve (k)", 1, 10, 5)
+    chunk_size    = st.slider("Chunk size", 100, 1000, 300, step=50)
+    chunk_overlap = st.slider("Chunk overlap", 0, 200, 50, step=10)
+    context_tokens = st.slider("Context token budget", 500, 4000, 1500, step=100)
 
-if uploaded_file is not None:
-    # Save file temporarily
-    with open("temp.pdf", "wb") as f:
-        f.write(uploaded_file.read())
+# -- File upload ---------------------------------------------------------------
+uploaded_files = st.file_uploader("Upload PDFs", type="pdf", accept_multiple_files=True)
 
-    st.success("File uploaded successfully!")
+if uploaded_files:
+    current_names = sorted([f.name for f in uploaded_files])
+    cache_key     = (current_names, chunk_size, chunk_overlap)
 
-    # Load PDF
-    loader = PyPDFLoader("temp.pdf")
-    docs = loader.load()
+    if st.session_state.get("cache_key") != cache_key:
+        st.session_state.clear()
+        st.session_state["cache_key"] = cache_key
 
-    # Show content preview
-    st.subheader("Document Content Preview")
-    for doc in docs[:3]:
-        st.write(doc.page_content)
+        pipeline = RAGPipeline()
 
-    # 🔥 Chunking
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=300,
-        chunk_overlap=50
-    )
+        for uploaded_file in uploaded_files:
+            path = f"temp_{uploaded_file.name}"
+            with open(path, "wb") as f:
+                f.write(uploaded_file.read())
+            pipeline.load(path, source_name=uploaded_file.name, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
 
-    chunks = splitter.split_documents(docs)
+        pipeline.build_index()
 
-    # Debug info
-    st.write(f"Number of pages loaded: {len(docs)}")
+        st.session_state["pipeline"] = pipeline
+        docs   = pipeline.docs
+        chunks = pipeline.chunks
+        st.session_state["docs"]   = docs
+        st.session_state["chunks"] = chunks
 
-    if len(chunks) > 0:
-        st.success(f"Document split into {len(chunks)} chunks")
     else:
-        st.warning("No chunks created")
+        pipeline = st.session_state["pipeline"]
+        docs     = st.session_state["docs"]
+        chunks   = st.session_state["chunks"]
 
-    # Safety check
+    col1, col2 = st.columns(2)
+    col1.metric("Pages loaded", len(docs))
+    col2.metric("Chunks created", len(chunks))
+
     if len(chunks) == 0:
-        st.error("❌ No text chunks found. Try another PDF.")
+        st.error("No text chunks found. Try another PDF.")
         st.stop()
 
-    # 🔥 Embeddings (FREE)
-    embeddings = HuggingFaceEmbeddings(
-        model_name="all-MiniLM-L6-v2"
+    with st.expander("Document Preview (first 3 pages)", expanded=False):
+        for i, doc in enumerate(docs[:3]):
+            st.markdown(f"**Page {i+1}**")
+            st.write(doc.page_content)
+            st.divider()
+
+    st.success("Both FAISS and BM25 indexes ready — Hybrid search active!")
+
+    sources = pipeline.get_sources()
+    source_filter = st.selectbox(
+        "Filter by document (optional)",
+        options=["All documents"] + sources
     )
+    selected_source = None if source_filter == "All documents" else source_filter
 
-    # 🔥 Vector DB
-    vector_store = FAISS.from_documents(chunks, embeddings)
-
-    st.success("Embeddings created and stored in FAISS")
-
-    # 💬 User question
-    query = st.text_input("Ask a question about your document")
+    st.divider()
+    query = st.text_input("Ask a question about your document", placeholder="e.g. What is the refund policy?")
 
     if query:
-        retriever = vector_store.as_retriever(search_kwargs={"k": 2})
-        results = retriever.get_relevant_documents(query)
+        with st.spinner("Thinking..."):
+            answer, results, scores, debug_info = pipeline.answer(
+                client,
+                query,
+                k=k,
+                source_filter=selected_source,
+                context_token_limit=context_tokens
+            )
 
-        st.subheader("Retrieved Chunks")
-        for doc in results[:3]:
-            st.write(doc.page_content)
+        st.divider()
+        st.subheader("Answer")
 
-        # Prepare context
-        context = "\n\n".join([doc.page_content for doc in results])
+        # build tooltip data for each citation number
+        tooltips = {}
+        for i, doc in enumerate(results, start=1):
+            source = doc.metadata.get("source", "unknown")
+            page   = doc.metadata.get("page", "?")
+            page_display = page + 1 if isinstance(page, int) else "?"
+            snippet = doc.page_content[:200].replace('"', "'").replace("\n", " ")
+            tooltips[i] = f"{source} — page {page_display}: {snippet}..."
 
-        # 🔥 HARD LIMIT
-        context = context[:800]
+        import re
+        def replace_citation(match):
+            num = int(match.group(1))
+            tip = tooltips.get(num, "source not found")
+            return (
+                f'<span style="'
+                f'border-bottom: 1px dotted #555;'
+                f'cursor: pointer;'
+                f'color: #1a73e8;'
+                f'font-weight: 500;'
+                f'" title="{tip}">[{num}]</span>'
+            )
 
-        # 🔥 GROQ LLM (FIXED)
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": "Answer only using the given context."},
-                {"role": "user", "content": f"Context:\n{context}\n\nQuestion:\n{query}"}
-            ]
-        )
+        annotated_answer = re.sub(r'\[(\d+)\]', replace_citation, answer)
 
-        answer = response.choices[0].message.content
-
-        st.subheader("📌 Answer")
-        st.write(answer)
+        st.markdown(annotated_answer, unsafe_allow_html=True)
